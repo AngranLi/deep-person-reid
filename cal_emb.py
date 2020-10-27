@@ -3,9 +3,19 @@ import os
 import torch
 import torchreid
 import numpy as np
-from PIL import Image
+import matplotlib.pyplot as plt
 from torchvision.transforms import functional as F
 from torchvision import models
+
+
+class Person():
+    
+    def __init__(self, num=None, bounding_box=[], prob=0, file_name='', embedding=0):
+        self.id   = num
+        self.bbox = bounding_box
+        self.prob=prob
+        self.fn   = file_name
+        self.emb  = embedding
 
 
 def load_pretrained_model(sd_path):
@@ -79,64 +89,141 @@ def test_pretrained_model(model):
     return
 
 
-def person_detection(img):
-    img_pt = F.to_tensor(img).unsqueeze(0)
-    img_pt = img_pt.to('cuda:0')
+def get_embs(model, predictions, img_names, imgs):
 
-    kprcnn = models.detection.keypointrcnn_resnet50_fpn(pretrained=True).eval()
-    kprcnn = kprcnn.to('cuda:0')
-
-    with torch.no_grad():
-        output = kprcnn(img_pt)[0]
-
-    bbps = []
-    kpts = []
-    for i in range(output['scores'].cpu().numpy().shape[0]):
-        if output['scores'][i].cpu().numpy() > 0.9:
-            bbps.append(output['boxes'][i].cpu().numpy().astype(int))
-            kpts.append(output['keypoints'][i].cpu().numpy().astype(int)[:, :2])
+    people = []
+    for n in range(len(predictions)):
+        for i in range(predictions[n]['scores'].cpu().numpy().shape[0]):
+            if predictions[n]['scores'][i].cpu().numpy() > 0.9:
+                bbp = predictions[n]['boxes'][i].cpu().numpy().astype(int)
+                if (bbp[3] - bbp[1]) * (bbp[2] - bbp[0]) < 1600:
+                    continue
+                prob = predictions[n]['scores'][i].cpu().numpy()
+                imp = imgs[n].copy()
+                imp = imp[bbp[1]:bbp[3], bbp[0]:bbp[2]]
+                imp = F.to_tensor(imp).to('cuda:0').unsqueeze(0)
+                
+                with torch.no_grad():
+                    emb = model(imp)
+                emb = torch.squeeze(emb)
+                n_emb = emb / emb.norm()
+                tmp_person = Person(num=i, bounding_box=bbp, prob=prob, file_name=img_names[n], embedding=n_emb)
+                people.append(tmp_person)
     
-    return bbps, kpts
+    return people
 
-def generate_embs(root_dir):
 
-    for root, dirs, files in os.walk(root_dir):
-        print(root)
+def get_imgs(root_dir):
+
+    imgs = []
+    imgs_pt = []
+    img_names = []
+
+    for root, _, files in os.walk(root_dir):
         for fn in files:
             if fn.endswith('.jpg'):
-                img = Image.open(os.path.join(root, fn))
-                bbps, kpts = person_detection(img)
-                embs = []
-                for bbp in bbps:
-                    person = img.crop(bbp)
-                    person = F.to_tensor(person).unsqueeze(0)
-                    # A trick needs to be considered.
-                    if person.shape[-1] * person.shape[-2] < 1600:
-                        continue
-                    person = person.to('cuda:0')
-                    with torch.no_grad():
-                        emb = model(person)
-                    embs.append(emb.cpu().numpy())
-                
-                np.save(os.path.join(root, fn[:-4]), np.array(embs).squeeze())
+                img_names.append(fn)
+                img = plt.imread(os.path.join(root, fn))
+                imgs.append(img)
+                imgs_pt.append(F.to_tensor(img.copy()).to('cuda:0'))
+
+    return imgs, imgs_pt, img_names
+
+
+def people_of_img(people, file_name):
+    """ Get the list of Person() of people in this image.
+    """
     
-    return
+    ppl_lst = []
+    for person in people:
+        if person.fn == file_name:
+            ppl_lst.append(person)
+            
+    return ppl_lst
 
 
+def img_with_most_ppl(people, img_names):
+    """ Get the image name with most people in it.
+    """
+
+    pers_num = []
+    for img_name in img_names:
+        pers_num.append(len(people_of_img(people, img_name)))
+    
+    return img_names[np.argmax(pers_num)]
+
+
+def set_person_id(people, img_names, img_most_ppl):
+    """
+    """
+
+    img_names.remove(img_most_ppl)
+    ppl_most = people_of_img(people, img_most_ppl)
+    for img_name in img_names:  
+        ppl_look_from = people_of_img(people, img_name)
+        for person in ppl_look_from:
+            cos_dists = {}
+            for pers_look_for in ppl_most:
+                cos_dists[(torch.dot(person.emb, pers_look_for.emb).item())] = pers_look_for.id
+            person.id = cos_dists[max(list(cos_dists.keys()))]
+
+
+def plot_for_test(people, root_dir, img_names):
+
+    for fn in img_names:
+        im = plt.imread(os.path.join(root_dir, fn))
+        people_here = people_of_img(people, fn)
+        for person in people_here:
+            label = f'person_{person.id}'
+            cv2.rectangle(im, tuple(person.bbox[:2]), tuple(person.bbox[2:]), color=(0, 255, 0))
+            cv2.putText(im,label,tuple(person.bbox[:2]),cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
+        
+        fig, ax = plt.subplots(figsize = (16,9))
+        ax.imshow(im)
+        plt.savefig(os.path.join(root_dir, 'reid_' + fn))
+        plt.close(fig)
 
 if __name__ == '__main__':
 
     sd_path = '/home/angran/GIT/deep-person-reid/log/osnet/osnet_ain_x1_0_market1501_256x128_amsgrad_ep100_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth'
-    model = load_pretrained_model(sd_path)
+    osnet = load_pretrained_model(sd_path)
 
-    # test_pretrained_model(model)
+    # test_pretrained_model(osnet)
+
+    kprcnn = models.detection.keypointrcnn_resnet50_fpn(pretrained=True)
+    kprcnn.eval()
+    kprcnn = kprcnn.to('cuda:0')
     
     root_dirs = [
         '/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/',
         '/nasty/scratch/common/msg/tms-gen1/reds/gen1_3imgs_perwt/'
-        # '/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/frames/alert-data-2020-10-08/ALR-1602085237421-574132'
     ]
     for root_dir in root_dirs:
-        generate_embs(root_dir)
-    
-                
+        old_root = ''
+        for root, dirs, files in os.walk(root_dir):
+            for fn in files:
+                if fn.endswith('.npy') or fn.endswith('.pickle'):
+                    os.remove(os.path.join(root, fn))
+
+                if fn.endswith('.jpg'):
+                    new_root = root
+                    if old_root != new_root:
+                        print(root)
+                        old_root = new_root
+                        imgs, imgs_pt, img_names = get_imgs(old_root)
+
+                        # Person Detection
+                        with torch.no_grad():
+                            predictions = kprcnn(imgs_pt)
+
+                        # list of Person()
+                        people = get_embs(osnet, predictions, img_names, imgs)
+
+                        # Get the image name with most people in it.
+                        img_most_ppl = img_with_most_ppl(people, img_names)
+                        
+                        # Set the person id in each image according to the person id 
+                        # in the image with most people in it
+                        set_person_id(people, img_names.copy(), img_most_ppl)
+                        
+                        plot_for_test(people, old_root, img_names)
