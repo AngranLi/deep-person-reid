@@ -96,7 +96,7 @@ def get_embs(model, predictions, img_names, imgs):
         for i in range(predictions[n]['scores'].cpu().numpy().shape[0]):
             if predictions[n]['scores'][i].cpu().numpy() > 0.9:
                 bbp = predictions[n]['boxes'][i].cpu().numpy().astype(int)
-                if (bbp[3] - bbp[1]) * (bbp[2] - bbp[0]) < 1600:
+                if (bbp[3] - bbp[1]) * (bbp[2] - bbp[0]) < 1600: # 10000?
                     continue
                 prob = predictions[n]['scores'][i].cpu().numpy()
                 imp = imgs[n].copy()
@@ -174,7 +174,7 @@ def plot_for_test(people, root_dir, img_names):
         im = plt.imread(os.path.join(root_dir, fn))
         people_here = people_of_img(people, fn)
         for person in people_here:
-            label = f'person_{person.id}'
+            label = str(person.id)
             cv2.rectangle(im, tuple(person.bbox[:2]), tuple(person.bbox[2:]), color=(0, 255, 0))
             cv2.putText(im,label,tuple(person.bbox[:2]),cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
         
