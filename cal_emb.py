@@ -13,7 +13,7 @@ class Person():
     def __init__(self, num=None, bounding_box=[], prob=0, file_name='', embedding=0):
         self.id   = num
         self.bbox = bounding_box
-        self.prob=prob
+        self.prob = prob
         self.fn   = file_name
         self.emb  = embedding
 
