@@ -40,58 +40,75 @@ class DetectionPipeline:
         
         return scores, boxes, classes
     
-    def __call__(self, filename):
+    def __call__(self, filename=None, fps=None):
         """Load frames from an MP4 video and detect faces.
 
         Arguments:
             filename {str} -- Path to video.
+            fps{list of str} -- File paths to images
         """
-        # Create video reader and find length
-        v_cap = cv2.VideoCapture(filename)
-        v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"frame count: {v_len}")
-        if v_len > 2400 or v_len <= 0:
-            print(f"Video broken.")
-            return
-        v_fps = int(v_cap.get(cv2.CAP_PROP_FPS))
         
-        
-        if v_len >= v_fps * 4:
-            idx_0 = v_len//2 - v_fps * 2 # 1 second before triggered time
-            idx_m = v_len//2 - v_fps     # approx. 1.0s latency for the camera
-            idx_l = v_len//2             # 1 second after triggered time
-        else: 
-            idx_0 = max(0, v_len//2 - v_fps)
-            idx_m = v_len//2
-            idx_l = min(v_len-1, v_len//2 + v_fps)
-        
+        ## Video
+        if filename is not None:
+            # Create video reader and find length
+            v_cap = cv2.VideoCapture(filename)
+            v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            print(f"frame count: {v_len}")
+            if v_len > 2400 or v_len <= 0:
+                print(f"Video broken.")
+                return
+            v_fps = int(v_cap.get(cv2.CAP_PROP_FPS))
 
-        # Pick 'n_frames' evenly spaced frames to sample
-        if self.n_frames is None:
-            sample = np.arange(idx_0, idx_l)
-        else:
-            sample = np.linspace(idx_0, idx_l, self.n_frames).astype(int)
+            if v_len >= v_fps * 4:
+                idx_0 = v_len//2 - v_fps * 2 # 1 second before triggered time
+                idx_m = v_len//2 - v_fps     # approx. 1.0s latency for the camera
+                idx_l = v_len//2             # 1 second after triggered time
+            else: 
+                idx_0 = max(0, v_len//2 - v_fps)
+                idx_m = v_len//2
+                idx_l = min(v_len-1, v_len//2 + v_fps)
 
+            # Pick 'n_frames' evenly spaced frames to sample
+            if self.n_frames is None:
+                sample = np.arange(idx_0, idx_l)
+            else:
+                sample = np.linspace(idx_0, idx_l, self.n_frames).astype(int)
+            
+            length = v_len
+            
+        ## Images
+        elif fps is not None:
+            sample = np.linspace(0, len(fps)-1, self.n_frames).astype(int)
+
+            length = len(fps)
+    
         # Loop through frames
         scores = []
         boxes = []
         classes = []
         frames = []
         frames_all = []
-        for j in range(v_len):
-            success = v_cap.grab()
+        
+        for j in range(length):
             if j in sample:
                 # Load frame
-                success, frame = v_cap.retrieve()
-                if not success:
-                    continue
+                ## Video
+                if filename is not None:
+                    success = v_cap.grab()
+                    success, frame = v_cap.retrieve()
+                    print(type(frame))
+                    if not success:
+                        continue
+                ## Images
+                elif fps is not None:
+                    frame = cv2.imread(fps[j])
+                    
                 # Resize frame to desired size and reorder channels
                 frame = cv2.resize(frame, self.resize, interpolation=cv2.INTER_CUBIC)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
+
                 frames.append(frame)
                 frames_all.append(frame)
-
                 # When batch is full, detect faces and reset frame list
                 if len(frames) % self.batch_size == 0 or j == sample[-1]:
                     scores_batch, boxes_batch, classes_batch = self.detector(frames)
@@ -99,8 +116,10 @@ class DetectionPipeline:
                     boxes.extend(boxes_batch)
                     classes.extend(classes_batch)
                     frames = []
-
-        v_cap.release()
+        
+        if filename is not None:
+            v_cap.release()
+            
 
         return frames_all, np.array(scores), np.array(boxes), np.array(classes)
 
@@ -210,7 +229,7 @@ def people_of_img(frames, scores, boxes, classes):
     people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 250]
     people = [p for p in people if np.mean(p.box_sz) > 10000]
 
-    for person in people:
+    for person in people.copy():
         if len(person.boxes) <= 1:
             people.remove(person)
 
@@ -223,7 +242,7 @@ def cal_movement(people):
         bb = np.array(person.boxes)
         top = bb[:, 1]
         bot = bb[:, 3]
-        if list(800 - bot < 50).count(True) > 7:
+        if list(800 - bot < 50).count(True) > 5:
             print("top")
             x = np.arange(len(top))
             k, b = np.polyfit(x, top, 1)
@@ -241,12 +260,12 @@ def cal_movement(people):
     return people
 
 
-def save_imgs(people, fn):
+def save_imgs(people, frame_i, fn):
 
     fig, axs = plt.subplots(2, 2, figsize=(16, 10))
     
     img_num = 0
-    for i in [0, 5, 10, 14]:
+    for i in frame_i:
         ax = axs[img_num//2][img_num%2]
         box_in_img = []
         direc_in_img = []
@@ -269,27 +288,52 @@ def save_imgs(people, fn):
 
 if __name__ == '__main__':
 
-    fps = glob.glob('/nasty/data/msg-ml/data/mt-healthy/tms/6ft/tms-1-and-2/**/*.mkv', recursive=True)
-    detector = DetectionPipeline('10.8.8.210:8001', 15)
-    img_save_path = '/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/direction_classification'  
+    # fps = glob.glob('/nasty/data/msg-ml/data/mt-healthy/tms/6ft/tms-1-and-2/**/*.mkv', recursive=True)
+    # detector = DetectionPipeline('10.8.8.210:8001', 15)
+    # img_save_path = '/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/direction_classification'  
 
+    # idx_lst = []
+    # for _ in range(200):
+    #     idx = np.random.randint(0, len(fps))
+    #     if idx in idx_lst:
+    #         continue
+    #     idx_lst.append(idx)
+    #     print(f"idx: {idx}")
+    #     try:
+    #         frames, scores, boxes, classes = detector(fps[idx])
+    #     except Exception as e:
+    #         print(f"Video {idx} is broken.")
+    #         continue
+    
+    detector = DetectionPipeline('10.8.8.210:8001', 15)
+    img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls'
+    tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
+    roots = []
+    for root in tmp_roots:
+        if '@' not in root:
+            roots.append('/'.join(root.split('/')[:-1]))
+    roots = np.unique(roots)
+    del tmp_roots
+    
     idx_lst = []
-    for _ in range(200):
-        idx = np.random.randint(0, len(fps))
+    for _ in range(100):
+        idx = np.random.randint(0, len(roots))
         if idx in idx_lst:
             continue
         idx_lst.append(idx)
         print(f"idx: {idx}")
-        try:
-            frames, scores, boxes, classes = detector(fps[idx])
-        except Exception as e:
-            print(f"Video {idx} is broken.")
-            continue
+
+        root = roots[idx]
+        fps = sorted(glob.glob(root + '/*.jpeg', recursive=True))
+
+        frames, scores, boxes, classes = detector(fps=fps)
+
 
         people = people_of_img(frames, scores, boxes, classes)
         print(f"num of people between pillars: {len(people)}")
 
         people = cal_movement(people)
  
-        fn = os.path.join(img_save_path, '/'.join(fps[idx].split('/')[-3:-1]))
-        save_imgs(people, fn)
+        fn = os.path.join(img_save_path, '/'.join(root.split('/')[-3:]))
+        frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
+        save_imgs(people, frame_i, fn)
