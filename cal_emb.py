@@ -45,6 +45,7 @@ def load_pretrained_model(sd_path):
 
     return model
 
+
 def test_pretrained_model(model):
 
     datamanager = torchreid.data.ImageDataManager(
@@ -182,6 +183,7 @@ def plot_for_test(people, root_dir, img_names):
         ax.imshow(im)
         plt.savefig(os.path.join(root_dir, 'reid_' + fn))
         plt.close(fig)
+
 
 if __name__ == '__main__':
 
