@@ -1,11 +1,13 @@
 import cv2
 import os, glob
+import torch
 import numpy as np
 from matplotlib import pyplot as plt, cm
 from matplotlib.animation import FuncAnimation
 from pathlib import Path
 from PIL import Image
 from tritonclient import grpc as triton
+from torchvision import transforms, models
 
 
 class DetectionPipeline:
@@ -124,6 +126,30 @@ class DetectionPipeline:
         return frames_all, np.array(scores), np.array(boxes), np.array(classes)
 
 
+def load_pretrained_model(sd_path):
+
+    model = models.resnet50(pretrained=True)
+    model.fc = torch.nn.Linear(2048, 3)
+    model = model.cuda()
+
+    state_dict = torch.load(sd_path)
+    model_dict = model.state_dict()
+
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            k = k[7:] # discard module.
+        if k in model_dict and model_dict[k].size() == v.size():
+            new_state_dict[k] = v
+
+    model_dict.update(new_state_dict)
+    model.load_state_dict(model_dict)
+
+    model = model.eval()
+
+    return model
+
+
 def iou(bb1, bb2):
     area1 = (bb1[2] - bb1[0]) * (bb1[3] - bb1[1])
     area2 = (bb2[2] - bb2[0]) * (bb2[3] - bb2[1])
@@ -142,21 +168,29 @@ def iou(bb1, bb2):
 
 class Person:
     
-    def __init__(self, num, box, prob, frame, direc=[255, 255, 0] ):
+    def __init__(self, num, box, prob, frame_i, direc=[255, 255, 0] ):
+        """ 
+        Args:
+            num (int): id of this person.
+            box (list of int): left/top/right/bottom boundary of bounding box.
+            prob (float, range[0, 1]): score for person detection.
+            frame_i (int): frame number in which this person exists.
+            direc (list of int, range[0, 255]): red-away, yellow-other, green-toward.
+        """
         self.id = num
         self.boxes = [box]
         self.box_sz = [(box[3] - box[1]) * (box[2] - box[0])]
         self.probs = [prob]
-        self.frames = [frame]
+        self.frames_i = [frame_i]
         self.centers = [[(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]]
         self.direc = direc
     
     
-    def add_frame(self, box, prob, frame):
+    def add_frame(self, box, prob, frame_i):
         self.boxes.append(box)
         self.box_sz.append([(box[3] - box[1]) * (box[2] - box[0])])
         self.probs.append(prob)
-        self.frames.append(frame)
+        self.frames_i.append(frame_i)
         self.centers.append([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])
     
     def compare(self, bounding_box):
@@ -186,10 +220,10 @@ def plot_directions(img, boxes, directions):
     return img_plt
 
 
-def people_of_img(frames, scores, boxes, classes):
+def people_of_img(n_frames, scores, boxes, classes):
 
     people = []
-    for i in range(len(frames)):
+    for i in range(n_frames):
         mask = (scores[i] > 0.6) & (classes[i] == 0)
         scores_i = scores[i, mask]
         boxes_i = boxes[i, mask]
@@ -236,8 +270,35 @@ def people_of_img(frames, scores, boxes, classes):
     return people
 
 
-def cal_movement(people):
+def cal_movement(people, frames, orient_cls):
 
+    for person in people:
+        person_imgs = []
+        for i in person.frames_i:
+            bb = person.boxes[person.frames_i.index(i)].astype(int)
+            person_img = Image.fromarray(frames[i][bb[1]:bb[3], bb[0]:bb[2]])
+            person_img = transforms.Compose([
+                transforms.Resize((244, 244)),
+                transforms.ToTensor()
+            ])(person_img)
+            person_imgs.append(person_img)
+        person_imgs = torch.stack(person_imgs).to('cuda:0')
+        logits = orient_cls(person_imgs)
+        probs = torch.nn.functional.softmax(logits, dim=1).detach().cpu().numpy()
+        direcs = list(np.argmax(probs, axis=1))
+        direc = max(direcs, key=direcs.count)
+        if direc == 0:
+            person.direc = [0, 255, 0]
+        elif direc == 1:
+            person.direc = [255, 255, 0]
+        elif direc == 2:
+            person.direc = [255, 0, 0]
+        else:
+            print(f"Orientation classification failed, the direcs list is {direcs}.")
+            return None
+    
+    return people
+    '''
     for person in people:
         bb = np.array(person.boxes)
         top = bb[:, 1]
@@ -256,6 +317,7 @@ def cal_movement(people):
             person.direc = [0, 255, 0]
         else:
             person.direc = [255, 255, 0]
+    '''
 
     return people
 
@@ -271,9 +333,10 @@ def save_imgs(people, frame_i, fn):
         direc_in_img = []
         for person in people:
             try:
-                box_in_img.append(person.boxes[person.frames.index(i)])
+                box_in_img.append(person.boxes[person.frames_i.index(i)])
                 direc_in_img.append(person.direc)
-            except:
+            except Exception as e:
+                # print(f"Got error: {e}")
                 pass
                     
         ax.imshow(plot_directions(frames[i], box_in_img, direc_in_img))
@@ -306,7 +369,12 @@ if __name__ == '__main__':
     #         continue
     
     detector = DetectionPipeline('10.8.8.210:8001', 15)
+
+    static_dict_path = '/home/angran/GIT/jupyter/ResNet_person_orientation/best.pt'
+    orient_cls = load_pretrained_model(static_dict_path)
+
     img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls'
+
     tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
     roots = []
     for root in tmp_roots:
@@ -329,10 +397,10 @@ if __name__ == '__main__':
         frames, scores, boxes, classes = detector(fps=fps)
 
 
-        people = people_of_img(frames, scores, boxes, classes)
+        people = people_of_img(len(frames), scores, boxes, classes)
         print(f"num of people between pillars: {len(people)}")
 
-        people = cal_movement(people)
+        people = cal_movement(people, frames, orient_cls)
  
         fn = os.path.join(img_save_path, '/'.join(root.split('/')[-3:]))
         frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
