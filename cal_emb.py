@@ -204,9 +204,6 @@ if __name__ == '__main__':
         old_root = ''
         for root, dirs, files in os.walk(root_dir):
             for fn in files:
-                if fn.endswith('.npy') or fn.endswith('.pickle'):
-                    os.remove(os.path.join(root, fn))
-
                 if fn.endswith('.jpg'):
                     new_root = root
                     if old_root != new_root:
