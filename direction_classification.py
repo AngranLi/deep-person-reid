@@ -168,7 +168,7 @@ def iou(bb1, bb2):
 
 class Person:
     
-    def __init__(self, num, box, prob, frame_i, direc=[255, 255, 0] ):
+    def __init__(self, num, box, prob, frame_i, embedding=0, direc=[255, 255, 0]):
         """ 
         Args:
             num (int): id of this person.
@@ -183,18 +183,23 @@ class Person:
         self.probs = [prob]
         self.frames_i = [frame_i]
         self.centers = [[(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]]
+        self.emb  = [embedding]
         self.direc = direc
     
     
-    def add_frame(self, box, prob, frame_i):
+    def add_frame(self, box, prob, frame_i, embedding):
         self.boxes.append(box)
         self.box_sz.append([(box[3] - box[1]) * (box[2] - box[0])])
         self.probs.append(prob)
         self.frames_i.append(frame_i)
         self.centers.append([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])
+        self.emb.append(embedding)
     
-    def compare(self, bounding_box):
+    def compare_iou(self, bounding_box):
         return iou(self.boxes[-1], bounding_box)
+    
+    def compare_emb(self, embedding):
+        return np.dot(self.emb[-1], embedding)
 
 
 def plot_boxes(img, boxes, classes):
@@ -220,10 +225,10 @@ def plot_directions(img, boxes, directions):
     return img_plt
 
 
-def people_of_img(n_frames, scores, boxes, classes):
+def people_of_img(frames, scores, boxes, classes, model):
 
     people = []
-    for i in range(n_frames):
+    for i in range(len(frames)):
         mask = (scores[i] > 0.6) & (classes[i] == 0)
         scores_i = scores[i, mask]
         boxes_i = boxes[i, mask]
@@ -244,20 +249,50 @@ def people_of_img(n_frames, scores, boxes, classes):
             m += 1
             n = m + 1
         
+        # Calculate embeddings for all the detected subjects
+        img = frames[i].copy()
+
+        embs = []
+        boxes_i = boxes_i.astype(int)
+        for j in range(len(scores_i)):
+            imp = img[boxes_i[j, 1]:boxes_i[j, 3], boxes_i[j, 0]:boxes_i[j, 2]]
+            imp = transforms.functional.to_tensor(imp).to('cuda:0').unsqueeze(0)
+            with torch.no_grad():
+                emb = model(imp)
+            emb = torch.squeeze(emb)
+            emb = emb / emb.norm()
+            embs.append(emb.cpu().numpy())
+        
+        # Include all people in the first image
         if len(people) == 0:
             for j in range(len(scores_i)):
-                people.append(Person(j, boxes_i[j], scores_i[j], i))
+                people.append(Person(j, boxes_i[j], scores_i[j], i, embs[j]))
             continue
-        
+            
+        # Find corresponding person according to emb
+        for j in range(len(scores_i)):
+            cos_dist = []
+            for person in people:
+                cos_dist.append(person.compare_emb(embs[j]))
+            print(f"cos_dist: {cos_dist}")
+            min_dist_ind = np.argmin(cos_dist)
+            if cos_dist[min_dist_ind] < 0.5: # Found the corresponding person
+                people[min_dist_ind].add_frame(boxes_i[j], scores_i[j], i, embs[j])
+            else: # Add the subject as a new person
+                people.append(Person(len(people), boxes_i[j], scores_i[j], i, embs[j]))
+
+        '''
+        # Find corresponding person according to IOU
         for j in range(len(scores_i)):
             ious_ij = []
             for person in people:
-                ious_ij.append(person.compare(boxes_i[j]))
+                ious_ij.append(person.compare_iou(boxes_i[j]))
             max_iou_ind = np.argmax(ious_ij)
-            if ious_ij[max_iou_ind] > 0.4:
+            if ious_ij[max_iou_ind] > 0.4: # Found the corresponding person
                 people[max_iou_ind].add_frame(boxes_i[j], scores_i[j], i)
-            else:
+            else: # Add the subject as a new person
                 people.append(Person(len(people), boxes_i[j], scores_i[j], i))
+        '''
 
     # Replace this mess with actual gate coordinates
     people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 250]
@@ -370,10 +405,13 @@ if __name__ == '__main__':
     
     detector = DetectionPipeline('10.8.8.210:8001', 15)
 
-    static_dict_path = '/home/angran/GIT/jupyter/ResNet_person_orientation/best.pt'
+    sd_path = '/home/angran/GIT/deep-person-reid/log/osnet/osnet_ain_x1_0_market1501_256x128_amsgrad_ep100_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth'
+    osnet = load_pretrained_model(sd_path)
+
+    static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
     orient_cls = load_pretrained_model(static_dict_path)
 
-    img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls'
+    img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls_rn_1'
 
     tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
     roots = []
@@ -396,12 +434,11 @@ if __name__ == '__main__':
 
         frames, scores, boxes, classes = detector(fps=fps)
 
-
-        people = people_of_img(len(frames), scores, boxes, classes)
+        people = people_of_img(frames, scores, boxes, classes, osnet)
         print(f"num of people between pillars: {len(people)}")
 
-        people = cal_movement(people, frames, orient_cls)
+        # people = cal_movement(people, frames, orient_cls)
  
-        fn = os.path.join(img_save_path, '/'.join(root.split('/')[-3:]))
-        frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
-        save_imgs(people, frame_i, fn)
+        # fn = os.path.join(img_save_path, '/'.join(root.split('/')[-3:]))
+        # frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
+        # save_imgs(people, frame_i, fn)
