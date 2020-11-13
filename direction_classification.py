@@ -123,12 +123,11 @@ class DetectionPipeline:
             # Create video reader and find length
             v_cap = cv2.VideoCapture(filename)
             v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            v_dur = v_len / 24
-            print(f"video duration: {np.round_(v_dur, 2)} seconds.")
             if v_len > 2400 or v_len <= 0:
-                print(f"Video broken.")
-                return
+                return None
             v_fps = int(v_cap.get(cv2.CAP_PROP_FPS))
+            v_dur = v_len / v_fps
+            print(f"video duration: {np.round_(v_dur, 2)} seconds.")
 
             if v_len >= v_fps * 4:
                 idx_0 = v_len//2 - v_fps * 2 # 1 second before triggered time
@@ -162,18 +161,18 @@ class DetectionPipeline:
         frames = []
         frames_all = []
         for j in range(length):
-            if j in sample:
-                # Load frame
-                ## Video
-                if filename is not None:
-                    success = v_cap.grab()
-                    success, frame = v_cap.retrieve()
-                    if not success:
-                        continue
-                ## Images
-                elif fps is not None:
-                    frame = cv2.imread(fps[j])
-                    
+            # Load frame
+            ## Video
+            if filename is not None:
+                success = v_cap.grab()
+                success, frame = v_cap.retrieve()
+                if not success:
+                    continue
+            ## Images
+            elif fps is not None:
+                frame = cv2.imread(fps[j])
+            
+            if j in sample: # Sample the frames we wanted
                 # Resize frame to desired size and reorder channels
                 frame = cv2.resize(frame, self.resize, interpolation=cv2.INTER_CUBIC)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -432,7 +431,7 @@ if __name__ == '__main__':
     # static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
     # orient_cls = load_pretrained_model(static_dict_path)
 
-    for frame_per_sec in [1, 5]:
+    for frame_per_sec in [1, 3, 5, 7]:
 
         detector = DetectionPipeline('10.8.8.210:8001', fpsec=frame_per_sec)
         img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_bboxmv_fps{frame_per_sec}'
