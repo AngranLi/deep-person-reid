@@ -2,6 +2,7 @@ import cv2
 import os, glob
 import torch
 import numpy as np
+import tritongrpcclient
 from matplotlib import pyplot as plt, cm
 from matplotlib.animation import FuncAnimation
 from pathlib import Path
@@ -13,21 +14,54 @@ from torchvision import transforms, models
 class DetectionPipeline:
     """Pipeline class for detecting people and faces in the frames of a video file."""
     
-    def __init__(self, triton_host, n_frames=None, batch_size=16, resize=(1280, 800)):
+    def __init__(self, triton_host, fpsec=None, batch_size=16, resize=(1280, 800)):
         """Constructor for DetectionPipeline class.
         
         Keyword Arguments:
-            n_frames {int} -- Total number of frames to load. These will be evenly spaced
+            fpsec {int} -- Frame per second for sampling the video. These will be evenly spaced
                 throughout the video. If not specified (i.e., None), all frames will be loaded.
                 (default: {None})
             batch_size {int} -- Batch size to use with detector. (default: {32})
             resize {tuple} -- Dimensions to resize frames to before inference. (default: {(1280, 800)})
         """
         self.triton_client = triton.InferenceServerClient(url=triton_host)
-        self.n_frames = n_frames
+        self.fpsec = fpsec
         self.batch_size = batch_size
         self.resize = resize
     
+    @staticmethod
+    def bbox_filter(scores_i, boxes_i):
+        
+        mask = (boxes_i[:, 3] - boxes_i[:, 1]) * (boxes_i[:, 2] - boxes_i[:, 0]) > 10000
+        scores_i = scores_i[mask]
+        boxes_i = boxes_i[mask]
+
+        # j = 0
+        # while j < len(boxes_i):
+        #     bsize = (boxes_i[j][3] - boxes_i[j][1]) * (boxes_i[j][2] - boxes_i[j][0])
+        #     if bsize < 10000:
+        #         scores_i = np.delete(scores_i, j, 0)
+        #         boxes_i = np.delete(boxes_i, j, 0)
+        #     j += 1
+
+        # Discard overlapped bboxes for same subject
+        m = 0
+        n = 1
+        while m < len(boxes_i) - 1:
+            while n < len(boxes_i):
+                if iou(boxes_i[m], boxes_i[n]) > 0.4:
+                    if scores_i[m] > scores_i[n]:
+                        scores_i = np.delete(scores_i, n, 0)
+                        boxes_i = np.delete(boxes_i, n, 0)
+                    else:
+                        scores_i = np.delete(scores_i, m, 0)
+                        boxes_i = np.delete(boxes_i, m, 0)
+                n += 1
+            m += 1
+            n = m + 1
+            
+        return scores_i, boxes_i
+
     def detector(self, frames):
         infer_inputs = [
             triton.InferInput('input_1', (len(frames), 3, *self.resize[::-1]), "FP32")
@@ -40,9 +74,43 @@ class DetectionPipeline:
         boxes = result.as_numpy('boxes').reshape((-1, 100, 4))
         classes = result.as_numpy('classes').reshape((-1, 100))
         
-        return scores, boxes, classes
+        # Calculate embeddings for all the detected subjects
+        embs = []
+        scores_filtered = []
+        boxes_filters = []
+        for i in range(len(frames)):
+            
+            mask = (scores[i] > 0.4) & (classes[i] == 0)
+            scores_i = scores[i, mask]
+            boxes_i = boxes[i, mask]
+
+            scores_i, boxes_i = self.bbox_filter(scores_i, boxes_i)
+            
+            img = frames[i].astype(np.uint8) # (3, 800, 1280)
+            embs_i = []
+            boxes_i = boxes_i.astype(int)
+            for j in range(len(boxes_i)):
+                imp = img[:, boxes_i[j, 1]:boxes_i[j, 3], boxes_i[j, 0]:boxes_i[j, 2]]
+                imp = np.transpose(imp, (1, 2, 0))
+                imp = Image.fromarray(imp)
+                data = [np.asarray(transforms.Resize(size=(256, 128))(imp)).astype(np.float32)]
+        
+                inputs = []
+                inputs.append(tritongrpcclient.InferInput('image', [len(data), 256, 128, 3], "FP32"))
+                # Initialize the data
+                inputs[0].set_data_from_numpy(np.asarray(data))
+                outputs = []
+                outputs.append(tritongrpcclient.InferRequestedOutput('features'))
+                results = self.triton_client.infer('osnet_ensemble', inputs, outputs=outputs)
+                emb = np.squeeze(results.as_numpy('features'))
+                embs_i.append(emb / np.linalg.norm(emb))
+            embs.append(embs_i)
+            scores_filtered.append(scores_i)
+            boxes_filters.append(boxes_i)
+        
+        return np.asarray(scores_filtered), np.asarray(boxes_filters), np.asarray(embs)
     
-    def __call__(self, filename=None, fps=None):
+    def __call__(self, filename=None, fps=None, n_frames=None):
         """Load frames from an MP4 video and detect faces.
 
         Arguments:
@@ -55,7 +123,8 @@ class DetectionPipeline:
             # Create video reader and find length
             v_cap = cv2.VideoCapture(filename)
             v_len = int(v_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            print(f"frame count: {v_len}")
+            v_dur = v_len / 24
+            print(f"video duration: {np.round_(v_dur, 2)} seconds.")
             if v_len > 2400 or v_len <= 0:
                 print(f"Video broken.")
                 return
@@ -71,26 +140,27 @@ class DetectionPipeline:
                 idx_l = min(v_len-1, v_len//2 + v_fps)
 
             # Pick 'n_frames' evenly spaced frames to sample
-            if self.n_frames is None:
+            if self.fpsec is None:
                 sample = np.arange(idx_0, idx_l)
             else:
-                sample = np.linspace(idx_0, idx_l, self.n_frames).astype(int)
+                n_frames = int(self.fpsec * v_dur)
+                print(f"n_frames for the video: {n_frames}")
+                sample = np.linspace(idx_0, idx_l, n_frames).astype(int)
             
             length = v_len
             
         ## Images
         elif fps is not None:
-            sample = np.linspace(0, len(fps)-1, self.n_frames).astype(int)
+            sample = np.linspace(0, len(fps)-1, n_frames).astype(int)
 
             length = len(fps)
     
         # Loop through frames
         scores = []
         boxes = []
-        classes = []
+        embs = []
         frames = []
         frames_all = []
-        
         for j in range(length):
             if j in sample:
                 # Load frame
@@ -98,7 +168,6 @@ class DetectionPipeline:
                 if filename is not None:
                     success = v_cap.grab()
                     success, frame = v_cap.retrieve()
-                    print(type(frame))
                     if not success:
                         continue
                 ## Images
@@ -113,17 +182,16 @@ class DetectionPipeline:
                 frames_all.append(frame)
                 # When batch is full, detect faces and reset frame list
                 if len(frames) % self.batch_size == 0 or j == sample[-1]:
-                    scores_batch, boxes_batch, classes_batch = self.detector(frames)
+                    scores_batch, boxes_batch, embs_batch = self.detector(frames)
                     scores.extend(scores_batch)
                     boxes.extend(boxes_batch)
-                    classes.extend(classes_batch)
+                    embs.extend(embs_batch)
                     frames = []
         
         if filename is not None:
             v_cap.release()
             
-
-        return frames_all, np.array(scores), np.array(boxes), np.array(classes)
+        return frames_all, np.array(scores), np.array(boxes), np.array(embs)
 
 
 def load_pretrained_model(sd_path):
@@ -217,69 +285,48 @@ def plot_boxes(img, boxes, classes):
     return img_plt
 
 
-def plot_directions(img, boxes, directions):
+def plot_directions(img, i, people):
     img_plt = img.copy()
-    for box, direc in zip(boxes, directions):
-        img_plt = cv2.rectangle(img_plt, tuple(box[:2]), tuple(box[2:]), direc, 3)
+
+    for person in people:
+        try:
+            box = person.boxes[person.frames_i.index(i)] # Find the bboxes corresponding to the given frame
+            direc = person.direc
+            label = 'P' + str(person.id)
+            img_plt = cv2.rectangle(img_plt, tuple(box[:2]), tuple(box[2:]), direc, 3)
+            img_plt = cv2.putText(img_plt,label,tuple(box[:2]),cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
+        except Exception as e:
+            # print(f"Got error: {e}")
+            pass
 
     return img_plt
 
 
-def people_of_img(frames, scores, boxes, classes, model):
+def people_of_img(frames, scores, boxes, embs):
 
     people = []
     for i in range(len(frames)):
-        mask = (scores[i] > 0.6) & (classes[i] == 0)
-        scores_i = scores[i, mask]
-        boxes_i = boxes[i, mask]
-        
-        # Discard overlapped bboxes for same subject
-        m = 0
-        n = 1
-        while m < len(boxes_i) - 1:
-            while n < len(boxes_i):
-                if iou(boxes_i[m], boxes_i[n]) > 0.4:
-                    if scores_i[m] > scores_i[n]:
-                        scores_i = np.delete(scores_i, n, 0)
-                        boxes_i = np.delete(boxes_i, n, 0)
-                    else:
-                        scores_i = np.delete(scores_i, m, 0)
-                        boxes_i = np.delete(boxes_i, m, 0)
-                n += 1
-            m += 1
-            n = m + 1
-        
-        # Calculate embeddings for all the detected subjects
-        img = frames[i].copy()
+        boxes_i = boxes[i]
+        scores_i = scores[i]
+        embs_i = embs[i]
 
-        embs = []
-        boxes_i = boxes_i.astype(int)
-        for j in range(len(scores_i)):
-            imp = img[boxes_i[j, 1]:boxes_i[j, 3], boxes_i[j, 0]:boxes_i[j, 2]]
-            imp = transforms.functional.to_tensor(imp).to('cuda:0').unsqueeze(0)
-            with torch.no_grad():
-                emb = model(imp)
-            emb = torch.squeeze(emb)
-            emb = emb / emb.norm()
-            embs.append(emb.cpu().numpy())
-        
         # Include all people in the first image
         if len(people) == 0:
-            for j in range(len(scores_i)):
-                people.append(Person(j, boxes_i[j], scores_i[j], i, embs[j]))
+            for j in range(len(embs_i)):
+                people.append(Person(j, boxes_i[j], scores_i[j], i, embs_i[j]))
             continue
-            
+        
         # Find corresponding person according to emb
-        for j in range(len(scores_i)):
-            cos_dist = []
+        for j in range(len(embs_i)):
+            cos_sim = []
             for person in people:
-                cos_dist.append(person.compare_emb(embs[j]))
-            print(f"cos_dist: {cos_dist}")
-            min_dist_ind = np.argmin(cos_dist)
-            if cos_dist[min_dist_ind] < 0.5: # Found the corresponding person
-                people[min_dist_ind].add_frame(boxes_i[j], scores_i[j], i, embs[j])
+                cos_sim.append(person.compare_emb(embs_i[j]))
+            # print(f"cos_sim: {cos_sim}")
+            max_sim_ind = np.argmax(cos_sim)
+            if cos_sim[max_sim_ind] > 0.75: # Find the corresponding person
+                people[max_sim_ind].add_frame(boxes_i[j], scores_i[j], i, embs_i[j])
             else: # Add the subject as a new person
-                people.append(Person(len(people), boxes_i[j], scores_i[j], i, embs[j]))
+                people.append(Person(len(people), boxes_i[j], scores_i[j], i, embs_i[j]))
 
         '''
         # Find corresponding person according to IOU
@@ -295,8 +342,7 @@ def people_of_img(frames, scores, boxes, classes, model):
         '''
 
     # Replace this mess with actual gate coordinates
-    people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 250]
-    people = [p for p in people if np.mean(p.box_sz) > 10000]
+    people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 300]
 
     for person in people.copy():
         if len(person.boxes) <= 1:
@@ -305,54 +351,52 @@ def people_of_img(frames, scores, boxes, classes, model):
     return people
 
 
-def cal_movement(people, frames, orient_cls):
+def cal_movement(people, frames, orient_cls=None):
 
-    for person in people:
-        person_imgs = []
-        for i in person.frames_i:
-            bb = person.boxes[person.frames_i.index(i)].astype(int)
-            person_img = Image.fromarray(frames[i][bb[1]:bb[3], bb[0]:bb[2]])
-            person_img = transforms.Compose([
-                transforms.Resize((244, 244)),
-                transforms.ToTensor()
-            ])(person_img)
-            person_imgs.append(person_img)
-        person_imgs = torch.stack(person_imgs).to('cuda:0')
-        logits = orient_cls(person_imgs)
-        probs = torch.nn.functional.softmax(logits, dim=1).detach().cpu().numpy()
-        direcs = list(np.argmax(probs, axis=1))
-        direc = max(direcs, key=direcs.count)
-        if direc == 0:
-            person.direc = [0, 255, 0]
-        elif direc == 1:
-            person.direc = [255, 255, 0]
-        elif direc == 2:
-            person.direc = [255, 0, 0]
-        else:
-            print(f"Orientation classification failed, the direcs list is {direcs}.")
-            return None
-    
-    return people
-    '''
-    for person in people:
-        bb = np.array(person.boxes)
-        top = bb[:, 1]
-        bot = bb[:, 3]
-        if list(800 - bot < 50).count(True) > 5:
-            print("top")
-            x = np.arange(len(top))
-            k, b = np.polyfit(x, top, 1)
-        else:
-            x = np.arange(len(bot))
-            k, b = np.polyfit(x, bot, 1)
+    if orient_cls is not None:
+        for person in people:
+            person_imgs = []
+            for i in person.frames_i:
+                bb = person.boxes[person.frames_i.index(i)].astype(int)
+                person_img = Image.fromarray(frames[i][bb[1]:bb[3], bb[0]:bb[2]])
+                person_img = transforms.Compose([
+                    transforms.Resize((244, 244)),
+                    transforms.ToTensor()
+                ])(person_img)
+                person_imgs.append(person_img)
+            person_imgs = torch.stack(person_imgs).to('cuda:0')
+            logits = orient_cls(person_imgs)
+            probs = torch.nn.functional.softmax(logits, dim=1).detach().cpu().numpy()
+            direcs = list(np.argmax(probs, axis=1))
+            direc = max(direcs, key=direcs.count)
+            if direc == 0:
+                person.direc = [0, 255, 0]
+            elif direc == 1:
+                person.direc = [255, 255, 0]
+            elif direc == 2:
+                person.direc = [255, 0, 0]
+            else:
+                print(f"Orientation classification failed, the direcs list is {direcs}.")
+                return None
+    else:
+        for person in people:
+            bb = np.array(person.boxes)
+            top = bb[:, 1]
+            bot = bb[:, 3]
+            if list(800 - bot < 50).count(True) > len(frames) // 3: # If feet of subject are truncated in 
+                print("top")                                        # 1/3 of the frames, use the top of the 
+                x = np.arange(len(top))                             # bounding box to calculate movement.
+                k, b = np.polyfit(x, top, 1)
+            else:
+                x = np.arange(len(bot))
+                k, b = np.polyfit(x, bot, 1)
 
-        if k > 4:
-            person.direc = [255, 0, 0]
-        elif k < -4:
-            person.direc = [0, 255, 0]
-        else:
-            person.direc = [255, 255, 0]
-    '''
+            if k > 15 * (4 / len(frames)):
+                person.direc = [255, 0, 0]
+            elif k < - 15 * (4 / len(frames)):
+                person.direc = [0, 255, 0]
+            else:
+                person.direc = [255, 255, 0]
 
     return people
 
@@ -364,17 +408,7 @@ def save_imgs(people, frame_i, fn):
     img_num = 0
     for i in frame_i:
         ax = axs[img_num//2][img_num%2]
-        box_in_img = []
-        direc_in_img = []
-        for person in people:
-            try:
-                box_in_img.append(person.boxes[person.frames_i.index(i)])
-                direc_in_img.append(person.direc)
-            except Exception as e:
-                # print(f"Got error: {e}")
-                pass
-                    
-        ax.imshow(plot_directions(frames[i], box_in_img, direc_in_img))
+        ax.imshow(plot_directions(frames[i], i, people))
         ax.set_title(f"frame {i}")
         img_num += 1
     
@@ -386,59 +420,63 @@ def save_imgs(people, frame_i, fn):
 
 if __name__ == '__main__':
 
-    # fps = glob.glob('/nasty/data/msg-ml/data/mt-healthy/tms/6ft/tms-1-and-2/**/*.mkv', recursive=True)
-    # detector = DetectionPipeline('10.8.8.210:8001', 15)
-    # img_save_path = '/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/direction_classification'  
-
-    # idx_lst = []
-    # for _ in range(200):
-    #     idx = np.random.randint(0, len(fps))
-    #     if idx in idx_lst:
-    #         continue
-    #     idx_lst.append(idx)
-    #     print(f"idx: {idx}")
-    #     try:
-    #         frames, scores, boxes, classes = detector(fps[idx])
-    #     except Exception as e:
-    #         print(f"Video {idx} is broken.")
-    #         continue
-    
-    detector = DetectionPipeline('10.8.8.210:8001', 15)
-
-    sd_path = '/home/angran/GIT/deep-person-reid/log/osnet/osnet_ain_x1_0_market1501_256x128_amsgrad_ep100_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth'
-    osnet = load_pretrained_model(sd_path)
-
-    static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
-    orient_cls = load_pretrained_model(static_dict_path)
-
-    img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls_rn_1'
-
-    tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
-    roots = []
-    for root in tmp_roots:
-        if '@' not in root:
-            roots.append('/'.join(root.split('/')[:-1]))
-    roots = np.unique(roots)
-    del tmp_roots
-    
+    fns = glob.glob('/nasty/data/msg-ml/data/mt-healthy/tms/6ft/tms-1-and-2/**/*.mkv', recursive=True)
     idx_lst = []
-    for _ in range(100):
-        idx = np.random.randint(0, len(roots))
+    for _ in range(200):
+        idx = np.random.randint(0, len(fns))
         if idx in idx_lst:
             continue
         idx_lst.append(idx)
-        print(f"idx: {idx}")
+    print(f"idx_lst: {idx_lst}")
 
-        root = roots[idx]
-        fps = sorted(glob.glob(root + '/*.jpeg', recursive=True))
+    # static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
+    # orient_cls = load_pretrained_model(static_dict_path)
 
-        frames, scores, boxes, classes = detector(fps=fps)
+    for frame_per_sec in [1, 5]:
 
-        people = people_of_img(frames, scores, boxes, classes, osnet)
-        print(f"num of people between pillars: {len(people)}")
+        detector = DetectionPipeline('10.8.8.210:8001', fpsec=frame_per_sec)
+        img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_bboxmv_fps{frame_per_sec}'
+    
+        for idx in idx_lst:
+            try:
+                frames, scores, boxes, embs = detector(filename=fns[idx])
+            except Exception as e:
+                print(f"Video broken: {fns[idx]}.")
+                print("======================================================")
+                continue
+        
+        # """ for reeds data
+        # img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls_rn_1'
 
-        # people = cal_movement(people, frames, orient_cls)
- 
-        # fn = os.path.join(img_save_path, '/'.join(root.split('/')[-3:]))
-        # frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
-        # save_imgs(people, frame_i, fn)
+        # tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
+        # roots = []
+        # for root in tmp_roots:
+        #     if '@' not in root:
+        #         roots.append('/'.join(root.split('/')[:-1]))
+        # roots = np.unique(roots)
+        # del tmp_roots
+        
+        # idx_lst = []
+        # for _ in range(100):
+        #     idx = np.random.randint(0, len(roots))
+        #     if idx in idx_lst:
+        #         continue
+        #     idx_lst.append(idx)
+        #     print(f"idx: {idx}")
+
+        #     root = roots[idx]
+        #     fps = sorted(glob.glob(root + '/*.jpeg', recursive=True))
+
+        #     frames, scores, boxes, embs = detector(fps=fps)
+        # """
+
+            people = people_of_img(frames, scores, boxes, embs)
+            print(f"num of people between pillars: {len(people)}")
+
+            people = cal_movement(people, frames)
+    
+            fn = os.path.join(img_save_path, '/'.join(fns[idx].split('/')[-3:-1]))
+            frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
+            save_imgs(people, frame_i, fn)
+            
+            print("======================================================")
