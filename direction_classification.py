@@ -142,8 +142,10 @@ class DetectionPipeline:
             if self.fpsec is None:
                 sample = np.arange(idx_0, idx_l)
             else:
-                n_frames = int(self.fpsec * v_dur)
-                print(f"n_frames for the video: {n_frames}")
+                n_frames = int(self.fpsec * v_dur * (idx_l - idx_0)/ v_len)
+                print(f"n_frames for the clip: {n_frames}")
+                if n_frames < 2:
+                    return None
                 sample = np.linspace(idx_0, idx_l, n_frames).astype(int)
             
             length = v_len
@@ -343,9 +345,9 @@ def people_of_img(frames, scores, boxes, embs):
     # Replace this mess with actual gate coordinates
     people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 300]
 
-    for person in people.copy():
-        if len(person.boxes) <= 1:
-            people.remove(person)
+    # for person in people.copy():
+    #     if len(person.boxes) <= 1:
+    #         people.remove(person)
 
     return people
 
@@ -400,7 +402,7 @@ def cal_movement(people, frames, orient_cls=None):
     return people
 
 
-def save_imgs(people, frame_i, fn):
+def save_imgs(people, frames, frame_i, fn):
 
     fig, axs = plt.subplots(2, 2, figsize=(16, 10))
     
@@ -420,27 +422,29 @@ def save_imgs(people, frame_i, fn):
 if __name__ == '__main__':
 
     fns = glob.glob('/nasty/data/msg-ml/data/mt-healthy/tms/6ft/tms-1-and-2/**/*.mkv', recursive=True)
-    idx_lst = []
-    for _ in range(200):
-        idx = np.random.randint(0, len(fns))
-        if idx in idx_lst:
-            continue
-        idx_lst.append(idx)
-    print(f"idx_lst: {idx_lst}")
+    # idx_lst = []
+    # for _ in range(200):
+    #     idx = np.random.randint(0, len(fns))
+    #     if idx in idx_lst:
+    #         continue
+    #     idx_lst.append(idx)
+    # print(f"idx_lst: {idx_lst}")
 
-    # static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
-    # orient_cls = load_pretrained_model(static_dict_path)
+    idx_lst = [330, 112, 2760, 2148, 421, 2977, 1535, 1907, 2753, 996, 3207, 1046, 2508, 3197, 1921, 409, 1595, 2466, 1290, 1260, 230, 1576, 15, 1247, 369, 381, 2763, 2081, 3245, 2804, 2223, 1161, 279, 532, 1774, 1430, 2617, 1702, 2308, 2632, 3115, 3032, 2510, 1281, 1501, 1986, 132, 368, 1236, 917, 2245, 2135, 844, 1010, 2074, 2407, 1220, 2010, 959, 2381, 2720, 335, 740, 1029, 2282, 3117, 501, 770, 121, 1848, 1908, 3026, 2534, 778, 967, 1060, 1176, 2133, 2896, 885, 1588, 3007, 168, 1191, 2378, 1310, 1529, 3066, 134, 497, 1941, 1665, 1687, 2080, 1728, 2611, 756, 1193, 475, 680, 2078, 2957, 799, 2338, 1383, 2562, 504, 2792, 432, 3211, 2958, 1987, 2288, 2613, 2116, 271, 2898, 1070, 3173, 865, 202, 2894, 340, 1423, 2716, 269, 2119, 1894, 3043, 1242, 1752, 1080, 3062, 659, 359, 1291, 2104, 2170, 505, 1609, 583, 1455, 2630, 2214, 391, 1997, 928, 819, 619, 34, 2482, 2012, 2880, 2976, 1407, 2793, 1810, 1567, 857, 1485, 711, 1850, 1091, 1514, 358, 910, 2663, 2755, 1272, 2152, 1547, 1120, 2100, 759, 1593, 753, 1849, 1006, 487, 2374, 2249, 2034, 3006, 1216, 1058, 1095, 2944, 2627, 2187]
 
-    for frame_per_sec in [1, 3, 5, 7]:
+    static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
+    orient_cls = load_pretrained_model(static_dict_path)
+
+    for frame_per_sec in [1]:
 
         detector = DetectionPipeline('10.8.8.210:8001', fpsec=frame_per_sec)
-        img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_bboxmv_fps{frame_per_sec}'
+        img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_rncls_fps{frame_per_sec}'
     
         for idx in idx_lst:
             try:
                 frames, scores, boxes, embs = detector(filename=fns[idx])
             except Exception as e:
-                print(f"Video broken: {fns[idx]}.")
+                print(f"Video broken or too short for fps rate {frame_per_sec}:\n {fns[idx]}.")
                 print("======================================================")
                 continue
         
@@ -472,10 +476,10 @@ if __name__ == '__main__':
             people = people_of_img(frames, scores, boxes, embs)
             print(f"num of people between pillars: {len(people)}")
 
-            people = cal_movement(people, frames)
+            people = cal_movement(people, frames, orient_cls)
     
             fn = os.path.join(img_save_path, '/'.join(fns[idx].split('/')[-3:-1]))
             frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
-            save_imgs(people, frame_i, fn)
+            save_imgs(people, frames, frame_i, fn)
             
             print("======================================================")
