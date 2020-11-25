@@ -79,8 +79,7 @@ class DetectionPipeline:
         scores_filtered = []
         boxes_filters = []
         for i in range(len(frames)):
-            
-            mask = (scores[i] > 0.4) & (classes[i] == 0)
+            mask = (scores[i] > 0.4) & (classes[i] == 0) # only care about 'person' with score > 0.4
             scores_i = scores[i, mask]
             boxes_i = boxes[i, mask]
 
@@ -129,7 +128,8 @@ class DetectionPipeline:
             v_dur = v_len / v_fps
             print(f"video duration: {np.round_(v_dur, 2)} seconds.")
 
-            if v_len >= v_fps * 4:
+            # Cut a <=2-second clip
+            if v_dur >= 4:
                 idx_0 = v_len//2 - v_fps * 2 # 1 second before triggered time
                 idx_m = v_len//2 - v_fps     # approx. 1.0s latency for the camera
                 idx_l = v_len//2             # 1 second after triggered time
@@ -237,7 +237,7 @@ def iou(bb1, bb2):
 
 class Person:
     
-    def __init__(self, num, box, prob, frame_i, embedding=0, direc=[255, 255, 0]):
+    def __init__(self, num, box, prob, frame_i, embedding=0, direc=[0, 0, 0]):
         """ 
         Args:
             num (int): id of this person.
@@ -303,7 +303,7 @@ def plot_directions(img, i, people):
     return img_plt
 
 
-def people_of_img(frames, scores, boxes, embs):
+def person_track(frames, scores, boxes, embs, fps):
 
     people = []
     for i in range(len(frames)):
@@ -317,7 +317,7 @@ def people_of_img(frames, scores, boxes, embs):
                 people.append(Person(j, boxes_i[j], scores_i[j], i, embs_i[j]))
             continue
         
-        # Find corresponding person according to emb
+        # Find corresponding person according to embeddings
         for j in range(len(embs_i)):
             cos_sim = []
             for person in people:
@@ -345,15 +345,18 @@ def people_of_img(frames, scores, boxes, embs):
     # Replace this mess with actual gate coordinates
     people = [p for p in people if np.abs(np.array(p.centers)[:, 0] - 600).min() < 300]
 
-    # for person in people.copy():
-    #     if len(person.boxes) <= 1:
-    #         people.remove(person)
+    # If the person only appears in one frame, delete it.
+    if fps >= 2: 
+        for person in people.copy():
+            if len(person.boxes) <= 1:
+                people.remove(person)
 
     return people
 
 
-def cal_movement(people, frames, orient_cls=None):
+def cal_movement(people, frames, fps, orient_cls=None):
 
+    # Use the orientation classifier only when fps < 2
     if orient_cls is not None:
         for person in people:
             person_imgs = []
@@ -392,9 +395,9 @@ def cal_movement(people, frames, orient_cls=None):
                 x = np.arange(len(bot))
                 k, b = np.polyfit(x, bot, 1)
 
-            if k > 15 * (4 / len(frames)):
+            if k > 7 * (4 / fps):
                 person.direc = [255, 0, 0]
-            elif k < - 15 * (4 / len(frames)):
+            elif k < - 7 * (4 / fps):
                 person.direc = [0, 255, 0]
             else:
                 person.direc = [255, 255, 0]
@@ -432,13 +435,13 @@ if __name__ == '__main__':
 
     idx_lst = [330, 112, 2760, 2148, 421, 2977, 1535, 1907, 2753, 996, 3207, 1046, 2508, 3197, 1921, 409, 1595, 2466, 1290, 1260, 230, 1576, 15, 1247, 369, 381, 2763, 2081, 3245, 2804, 2223, 1161, 279, 532, 1774, 1430, 2617, 1702, 2308, 2632, 3115, 3032, 2510, 1281, 1501, 1986, 132, 368, 1236, 917, 2245, 2135, 844, 1010, 2074, 2407, 1220, 2010, 959, 2381, 2720, 335, 740, 1029, 2282, 3117, 501, 770, 121, 1848, 1908, 3026, 2534, 778, 967, 1060, 1176, 2133, 2896, 885, 1588, 3007, 168, 1191, 2378, 1310, 1529, 3066, 134, 497, 1941, 1665, 1687, 2080, 1728, 2611, 756, 1193, 475, 680, 2078, 2957, 799, 2338, 1383, 2562, 504, 2792, 432, 3211, 2958, 1987, 2288, 2613, 2116, 271, 2898, 1070, 3173, 865, 202, 2894, 340, 1423, 2716, 269, 2119, 1894, 3043, 1242, 1752, 1080, 3062, 659, 359, 1291, 2104, 2170, 505, 1609, 583, 1455, 2630, 2214, 391, 1997, 928, 819, 619, 34, 2482, 2012, 2880, 2976, 1407, 2793, 1810, 1567, 857, 1485, 711, 1850, 1091, 1514, 358, 910, 2663, 2755, 1272, 2152, 1547, 1120, 2100, 759, 1593, 753, 1849, 1006, 487, 2374, 2249, 2034, 3006, 1216, 1058, 1095, 2944, 2627, 2187]
 
-    static_dict_path = '/home/angran/GIT/jupyter/logs/rn_orient/best.pt'
+    static_dict_path = '/home/angran/GIT/jupyter/logs/ResNet_person_orientation/best.pt'
     orient_cls = load_pretrained_model(static_dict_path)
 
-    for frame_per_sec in [1]:
+    for frame_per_sec in [2, 7]:
 
         detector = DetectionPipeline('10.8.8.210:8001', fpsec=frame_per_sec)
-        img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_rncls_fps{frame_per_sec}'
+        img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_fps{frame_per_sec}'
     
         for idx in idx_lst:
             try:
@@ -448,7 +451,7 @@ if __name__ == '__main__':
                 print("======================================================")
                 continue
         
-        # """ for reeds data
+        # """ For reeds data
         # img_save_path = '/nasty/scratch/common/msg/tms-gen1/reds/direc_cls_rn_1'
 
         # tmp_roots = glob.glob('/nasty/scratch/common/msg/tms-gen1/reds/gen1/**/*.jpeg', recursive=True)
@@ -473,10 +476,29 @@ if __name__ == '__main__':
         #     frames, scores, boxes, embs = detector(fps=fps)
         # """
 
-            people = people_of_img(frames, scores, boxes, embs)
+            people = person_track(frames, scores, boxes, embs, frame_per_sec)
             print(f"num of people between pillars: {len(people)}")
 
-            people = cal_movement(people, frames, orient_cls)
+            # When fps rate is too low, use IOU to find the definite static subjects first
+            if frame_per_sec < 2:
+                for i in range(1, len(frames)):
+                    bboxes_curr = boxes[i]
+                    bboxes_prir = boxes[i-1]
+                    for bbox_curr in bboxes_curr:
+                        for bbox_prir in bboxes_prir:
+                            if iou(bbox_curr, bbox_prir) > 0.8:
+                                for person in people:
+                                    if any([all(np.equal(bbox_curr, bb).flatten()) for bb in person.boxes]):
+                                        person.direc = [255, 255, 255]
+                people_left = []
+                for person in people.copy():
+                    if person.direc == [0, 0, 0]:
+                        people_left.append(person)
+                        people.remove(person)
+                people_left = cal_movement(people_left, frames, frame_per_sec, orient_cls)
+                people += people_left
+            else:
+                people = cal_movement(people, frames, frame_per_sec)
     
             fn = os.path.join(img_save_path, '/'.join(fns[idx].split('/')[-3:-1]))
             frame_i = [0, len(frames)//3, len(frames)//3 * 2, len(frames)-1]
