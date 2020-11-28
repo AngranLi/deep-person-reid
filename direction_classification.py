@@ -449,7 +449,7 @@ if __name__ == '__main__':
     static_dict_path = '/home/angran/GIT/jupyter/logs/ResNet_person_orientation/best.pt'
     orient_cls = load_pretrained_model(static_dict_path)
 
-    for frame_per_sec in [2, 7]:
+    for frame_per_sec in [3, 4]:
 
         detector = DetectionPipeline('10.8.8.210:8001', fpsec=frame_per_sec)
         img_save_path = f'/nasty/scratch/common/msg/tms/Gen-1.1-6ft/Mt-Healthy/reid_fps{frame_per_sec}'
